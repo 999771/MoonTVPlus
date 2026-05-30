@@ -1,5 +1,36 @@
 import { SearchResult } from '@/lib/types';
 
+type SearchCachePayload = {
+  status: 'complete' | 'partial';
+  results: SearchResult[];
+  query: string;
+  updatedAt: number;
+};
+
+function getCachedSearchResults(query?: string | null) {
+  const keyword = query?.trim();
+  if (!keyword || typeof window === 'undefined') return null;
+  try {
+    const cached = sessionStorage.getItem(`search_cache_${keyword}`);
+    if (!cached) return null;
+    const parsed = JSON.parse(cached) as SearchCachePayload;
+    if (Array.isArray(parsed.results) && parsed.results.length > 0) return parsed.results;
+  } catch {
+    // ignore invalid cache
+  }
+  return null;
+}
+
+async function fetchSearchResults(query: string) {
+  const cached = getCachedSearchResults(query);
+  if (cached) return cached;
+
+  const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error('搜索播放源失败');
+  const data = await res.json();
+  return (data.results || []) as SearchResult[];
+}
+
 export async function fetchTVDetail(params: {
   source?: string | null;
   id?: string | null;
@@ -18,15 +49,11 @@ export async function fetchTVDetail(params: {
     const searchTitle = title || detail.title;
     if (searchTitle) {
       try {
-        const searchRes = await fetch(`/api/search?q=${encodeURIComponent(searchTitle)}`, { cache: 'no-store' });
-        if (searchRes.ok) {
-          const data = await searchRes.json();
-          const list = (data.results || []) as SearchResult[];
-          sources = [
-            detail,
-            ...list.filter((item) => !(item.source === detail.source && item.id === detail.id)),
-          ];
-        }
+        const list = await fetchSearchResults(searchTitle);
+        sources = [
+          detail,
+          ...list.filter((item) => !(item.source === detail.source && item.id === detail.id)),
+        ];
       } catch {
         // 换源搜索失败不影响当前播放
       }
@@ -35,10 +62,7 @@ export async function fetchTVDetail(params: {
   }
 
   if (!title) throw new Error('缺少片名');
-  const res = await fetch(`/api/search?q=${encodeURIComponent(title)}`, { cache: 'no-store' });
-  if (!res.ok) throw new Error('搜索播放源失败');
-  const data = await res.json();
-  const sources = (data.results || []) as SearchResult[];
+  const sources = await fetchSearchResults(title);
   if (sources.length === 0) throw new Error('未找到播放源');
   let detail = sources[0];
   if (!detail.episodes?.length) {
