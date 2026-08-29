@@ -59,13 +59,14 @@ jobs:
       - name: 组装 Electron 外壳（自动登录版）
         shell: bash
         run: |
-          mkdir -p pack/app/.next
-          cp -r .next/standalone/. pack/app/
-          if [ -d public ]; then cp -r public pack/app/public; fi
-          cp -r .next/static pack/app/.next/static
+          mkdir -p pack/webapp/.next
+          cp -r .next/standalone/. pack/webapp/
+          if [ -d public ]; then cp -r public pack/webapp/public; fi
+          cp -r .next/static pack/webapp/.next/static
           cp "$(which node)" pack/node.exe
           echo "内置 Node 版本: $(node --version)"
-          cat > pack/main.js <<'EOF'
+          mkdir -p pack/electron
+          cat > pack/electron/main.js <<'EOF'
             const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
             const { spawn } = require('child_process');
             const path = require('path');
@@ -78,8 +79,8 @@ jobs:
             let serverProc = null;
 
             function startServer() {
-              const base = app.isPackaged ? process.resourcesPath : __dirname;
-              const serverJs = path.join(base, 'app', 'server.js');
+              const base = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..');
+              const serverJs = path.join(base, 'webapp', 'server.js');
               const bundledNode = path.join(base, 'node.exe');
               const useBundledNode = fs.existsSync(bundledNode);
 
@@ -194,12 +195,21 @@ jobs:
             app.on('window-all-closed', function () { app.quit(); });
             app.on('before-quit', stopServer);
           EOF
-          cat > pack/package.json <<'EOF'
+          cat > pack/electron/package.json <<'EOF'
             {
               "name": "moontvplus-desktop",
-              "version": "1.2.0",
+              "version": "1.3.0",
+              "description": "MoonTVPlus desktop shell",
+              "author": "MoonTVPlus",
               "private": true,
-              "main": "main.js",
+              "main": "main.js"
+            }
+          EOF
+          cat > pack/package.json <<'EOF'
+            {
+              "name": "moontvplus-pack",
+              "version": "1.3.0",
+              "private": true,
               "devDependencies": {
                 "electron": "^33.0.0",
                 "electron-builder": "^25.1.8"
@@ -207,11 +217,10 @@ jobs:
               "build": {
                 "appId": "com.moontvplus.desktop",
                 "productName": "MoonTVPlus",
-                "directories": { "output": "dist" },
+                "directories": { "output": "dist", "app": "electron" },
                 "npmRebuild": false,
-                "files": ["main.js", "package.json"],
                 "extraResources": [
-                  { "from": "app", "to": "app" },
+                  { "from": "webapp", "to": "webapp" },
                   { "from": "node.exe", "to": "node.exe" }
                 ],
                 "win": { "target": ["portable", "nsis"] },
