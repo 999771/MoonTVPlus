@@ -21,6 +21,11 @@ jobs:
         shell: bash
         run: |
           npm install -g pnpm@9
+          # 修复：项目自带的 pnpm-workspace.yaml 缺少 packages 字段，pnpm 9 会报错
+          # 检测到缺少就自动补上
+          if [ -f pnpm-workspace.yaml ] && ! grep -q '^packages:' pnpm-workspace.yaml; then
+            printf '\npackages:\n  - .\n' >> pnpm-workspace.yaml
+          fi
           if [ -f pnpm-lock.yaml ]; then
             pnpm install --no-frozen-lockfile
           else
@@ -35,9 +40,17 @@ jobs:
           if (!f) { console.log('no next.config, skip'); process.exit(0); }
           let s = fs.readFileSync(f, 'utf8');
           if (s.indexOf('standalone') !== -1) { console.log('standalone already set'); process.exit(0); }
-          s = s.replace(/(const\s+nextConfig[^{]*\{)/, '$1\n  output: "standalone",');
+          if (/(const\s+nextConfig[^{]*\{)/.test(s)) {
+            s = s.replace(/(const\s+nextConfig[^{]*\{)/, '$1\n  output: "standalone",');
+          } else if (/(module\.exports\s*=\s*\{)/.test(s)) {
+            s = s.replace(/(module\.exports\s*=\s*\{)/, '$1\n  output: "standalone",');
+          } else if (/(export\s+default\s*\{)/.test(s)) {
+            s = s.replace(/(export\s+default\s*\{)/, '$1\n  output: "standalone",');
+          } else {
+            console.log('WARN: 未找到 next.config 插入点');
+          }
           fs.writeFileSync(f, s);
-          console.log('standalone injected into ' + f);
+          console.log('standalone ensured in ' + f);
 
       - name: 构建 Next.js
         shell: bash
@@ -45,7 +58,7 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: '1'
 
-      - name: 组装 Electron 外壳
+      - name: 组装 Electron 外壳（自动登录版）
         shell: bash
         run: |
           mkdir -p pack/app/.next
@@ -60,6 +73,7 @@ jobs:
 
             const HOST = '127.0.0.1';
             const PORT = 3690;
+            const PASSWORD = '123456';
             let serverProc = null;
 
             function startServer() {
@@ -71,7 +85,7 @@ jobs:
                   NODE_ENV: 'production',
                   HOSTNAME: HOST,
                   PORT: String(PORT),
-                  PASSWORD: '123456'
+                  PASSWORD: PASSWORD
                 }),
                 stdio: 'ignore',
                 windowsHide: true
@@ -102,6 +116,44 @@ jobs:
               });
             }
 
+            function autoLogin(win) {
+              const script = `
+                (function () {
+                  var PWD = ${JSON.stringify(PASSWORD)};
+                  var n = 0;
+                  var timer = setInterval(function () {
+                    n++;
+                    var input = document.querySelector('input[type="password"]');
+                    var form = document.querySelector('form');
+                    var btn = form ? form.querySelector('button[type="submit"], button:not([type="button"]):not([type="reset"])') : null;
+                    if (!btn) {
+                      var all = document.querySelectorAll('button');
+                      for (var i = 0; i < all.length; i++) {
+                        var t = (all[i].textContent || '').trim().toLowerCase();
+                        if (t.indexOf('登录') > -1 || t.indexOf('login') > -1) { btn = all[i]; break; }
+                      }
+                    }
+                    if (input && btn) {
+                      try {
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(input, PWD);
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                      } catch (e) { input.value = PWD; }
+                      clearInterval(timer);
+                      setTimeout(function () {
+                        try {
+                          if (form && form.requestSubmit) { form.requestSubmit(); } else { btn.click(); }
+                        } catch (e) { btn.click(); }
+                      }, 300);
+                    } else if (n > 60) {
+                      clearInterval(timer);
+                    }
+                  }, 250);
+                })();
+              `;
+              win.webContents.executeJavaScript(script).catch(function () {});
+            }
+
             function createWindow() {
               Menu.setApplicationMenu(null);
               const win = new BrowserWindow({
@@ -115,6 +167,10 @@ jobs:
               win.webContents.setWindowOpenHandler(function (d) {
                 if (d.url.indexOf('http') === 0) shell.openExternal(d.url);
                 return { action: 'deny' };
+              });
+              win.webContents.on('did-finish-load', function () {
+                const url = (win.webContents.getURL() || '').toLowerCase();
+                if (url.indexOf('/login') > -1) { autoLogin(win); }
               });
               win.loadURL('http://' + HOST + ':' + PORT);
             }
@@ -133,7 +189,7 @@ jobs:
           cat > pack/package.json <<'EOF'
             {
               "name": "moontvplus-desktop",
-              "version": "1.0.0",
+              "version": "1.1.0",
               "private": true,
               "main": "main.js",
               "devDependencies": {
