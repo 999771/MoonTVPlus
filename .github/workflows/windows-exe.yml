@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: 拉取代码
@@ -24,6 +24,7 @@ jobs:
           if [ -f pnpm-workspace.yaml ] && ! grep -q '^packages:' pnpm-workspace.yaml; then
             printf '\npackages:\n  - .\n' >> pnpm-workspace.yaml
           fi
+          echo "node-linker=hoisted" >> .npmrc
           if [ -f pnpm-lock.yaml ]; then
             pnpm install --no-frozen-lockfile
           else
@@ -56,7 +57,7 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: '1'
 
-      - name: 组装 Electron 外壳（自动登录版）
+      - name: 组装 Electron 外壳与内置 Node
         shell: bash
         run: |
           mkdir -p pack/webapp/.next
@@ -66,66 +67,116 @@ jobs:
           cp "$(which node)" pack/node.exe
           echo "内置 Node 版本: $(node --version)"
           mkdir -p pack/electron
-          cat > pack/electron/main.js <<'EOF'
+          cat > pack/electron/main.js <<'EOF_MAIN'
             const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
             const { spawn } = require('child_process');
             const path = require('path');
             const fs = require('fs');
             const http = require('http');
+            const net = require('net');
 
-            const HOST = '127.0.0.1';
-            const PORT = 3690;
             const PASSWORD = '123456';
+            const HOST = '127.0.0.1';
+            let PORT = 3690;
             let serverProc = null;
+            let win = null;
+            let splash = null;
+            let quitting = false;
 
-            function startServer() {
+            if (!app.requestSingleInstanceLock()) { app.quit(); }
+            app.on('second-instance', function () {
+              if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+            });
+
+            function logPath() { return path.join(app.getPath('userData'), 'server.log'); }
+
+            function logTail(n) {
+              try {
+                return fs.readFileSync(logPath(), 'utf8')
+                  .split(/\r?\n/)
+                  .filter(function (l) { return l.trim().length > 0; })
+                  .slice(-n).join('\n');
+              } catch (e) { return '(没有日志文件)'; }
+            }
+
+            function findFreePort(start) {
+              return new Promise(function (resolve, reject) {
+                (function probe(p) {
+                  if (p > start + 20) { reject(new Error('no free port')); return; }
+                  const s = net.createServer();
+                  s.once('error', function () { try { s.close(); } catch (e) {} probe(p + 1); });
+                  s.once('listening', function () { s.close(function () { resolve(p); }); });
+                  s.listen(p, HOST);
+                })(start);
+              });
+            }
+
+            function startServer(port) {
               const base = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..');
-              const serverJs = path.join(base, 'webapp', 'server.js');
-              const bundledNode = path.join(base, 'node.exe');
-              const useBundledNode = fs.existsSync(bundledNode);
+              const webapp = path.join(base, 'webapp');
+              const serverJs = path.join(webapp, 'server.js');
+              const nodeExe = path.join(base, 'node.exe');
+
+              if (!fs.existsSync(serverJs)) {
+                try { fs.writeFileSync(logPath(), '致命错误：找不到服务文件 ' + serverJs); } catch (e) {}
+                return;
+              }
 
               const env = Object.assign({}, process.env, {
                 NODE_ENV: 'production',
                 HOSTNAME: HOST,
-                PORT: String(PORT),
+                PORT: String(port),
                 PASSWORD: PASSWORD
               });
+              let cmd = nodeExe;
+              if (!fs.existsSync(nodeExe)) { cmd = process.execPath; env.ELECTRON_RUN_AS_NODE = '1'; }
 
-              const cmd = useBundledNode ? bundledNode : process.execPath;
-              if (!useBundledNode) { env.ELECTRON_RUN_AS_NODE = '1'; }
-
-              serverProc = spawn(cmd, [serverJs], {
-                env: env,
-                stdio: 'ignore',
-                windowsHide: true
+              try { fs.mkdirSync(app.getPath('userData'), { recursive: true }); } catch (e) {}
+              const fdOut = fs.openSync(logPath(), 'w');
+              const fdErr = fs.openSync(logPath(), 'a');
+              serverProc = spawn(cmd, [serverJs], { cwd: webapp, env: env, stdio: ['ignore', fdOut, fdErr], windowsHide: true });
+              serverProc.on('exit', function (code) {
+                try { fs.appendFileSync(logPath(), '\n[服务进程退出] code=' + code); } catch (e) {}
+              });
+              serverProc.on('error', function (e) {
+                try { fs.appendFileSync(logPath(), '\n[启动进程失败] ' + e.message); } catch (e2) {}
               });
             }
 
-            function stopServer() {
-              if (!serverProc) return;
-              try {
-                if (process.platform === 'win32') {
-                  spawn('taskkill', ['/pid', String(serverProc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-                } else {
-                  serverProc.kill();
-                }
-              } catch (e) {}
-            }
-
-            function waitForServer() {
+            function waitForServer(port) {
               const started = Date.now();
               return new Promise(function (resolve, reject) {
+                let dead = false;
+                if (serverProc) {
+                  serverProc.once('exit', function () { dead = true; reject(new Error('服务进程提前退出')); });
+                }
                 (function ping() {
-                  const req = http.get('http://' + HOST + ':' + PORT, function (res) { res.resume(); resolve(); });
+                  if (quitting) { reject(new Error('quitting')); return; }
+                  const req = http.get('http://' + HOST + ':' + port, function (res) { res.resume(); resolve(); });
                   req.on('error', function () {
-                    if (Date.now() - started > 60000) { reject(new Error('timeout')); }
+                    if (dead) return;
+                    if (Date.now() - started > 90000) { reject(new Error('等待服务超时')); }
                     else { setTimeout(ping, 400); }
                   });
                 })();
               });
             }
 
-            function autoLogin(win) {
+            function showSplash() {
+              splash = new BrowserWindow({
+                width: 360, height: 190, frame: false, resizable: false,
+                alwaysOnTop: true, show: false, center: true,
+                webPreferences: { contextIsolation: true, nodeIntegration: false }
+              });
+              const html = '<!doctype html><html><head><meta charset="utf-8"></head>'
+                + '<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#fff;font-family:Microsoft YaHei,sans-serif">'
+                + '<div style="text-align:center"><div style="font-size:20px;font-weight:bold;margin-bottom:10px">MoonTVPlus</div>'
+                + '<div style="font-size:13px;opacity:.75">正在启动，请稍候…<br>首次运行可能需要十几秒</div></div></body></html>';
+              splash.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+              splash.once('ready-to-show', function () { splash.show(); });
+            }
+
+            function autoLogin(winRef) {
               const script = `
                 (function () {
                   var PWD = ${JSON.stringify(PASSWORD)};
@@ -150,26 +201,20 @@ jobs:
                       } catch (e) { input.value = PWD; }
                       clearInterval(timer);
                       setTimeout(function () {
-                        try {
-                          if (form && form.requestSubmit) { form.requestSubmit(); } else { btn.click(); }
-                        } catch (e) { btn.click(); }
+                        try { if (form && form.requestSubmit) { form.requestSubmit(); } else { btn.click(); } }
+                        catch (e) { btn.click(); }
                       }, 300);
-                    } else if (n > 60) {
-                      clearInterval(timer);
-                    }
+                    } else if (n > 60) { clearInterval(timer); }
                   }, 250);
                 })();
               `;
-              win.webContents.executeJavaScript(script).catch(function () {});
+              winRef.webContents.executeJavaScript(script).catch(function () {});
             }
 
-            function createWindow() {
+            function createWindow(port) {
               Menu.setApplicationMenu(null);
-              const win = new BrowserWindow({
-                width: 1360,
-                height: 850,
-                title: 'MoonTVPlus',
-                show: false,
+              win = new BrowserWindow({
+                width: 1360, height: 850, title: 'MoonTVPlus', show: false,
                 webPreferences: { contextIsolation: true, nodeIntegration: false }
               });
               win.once('ready-to-show', function () { win.show(); });
@@ -179,36 +224,55 @@ jobs:
               });
               win.webContents.on('did-finish-load', function () {
                 const url = (win.webContents.getURL() || '').toLowerCase();
-                if (url.indexOf('/login') > -1) { autoLogin(win); }
+                if (url.indexOf('/login') > -1) autoLogin(win);
               });
-              win.loadURL('http://' + HOST + ':' + PORT);
+              win.loadURL('http://' + HOST + ':' + port);
             }
 
-            app.whenReady().then(function () {
-              startServer();
-              waitForServer().then(createWindow).catch(function () {
-                dialog.showErrorBox('启动失败', '内置服务未能启动，请重新打开程序试试。');
+            app.whenReady().then(async function () {
+              showSplash();
+              try { PORT = await findFreePort(3690); } catch (e) { PORT = 3690; }
+              try {
+                startServer(PORT);
+                await waitForServer(PORT);
+                if (splash) { try { splash.destroy(); } catch (e) {} splash = null; }
+                createWindow(PORT);
+              } catch (e) {
+                if (splash) { try { splash.destroy(); } catch (e2) {} splash = null; }
+                dialog.showErrorBox('MoonTVPlus 启动失败',
+                  '内置服务未能启动。\n\n----- 日志最后 25 行 -----\n'
+                  + logTail(25)
+                  + '\n\n完整日志位置：\n' + logPath());
                 app.quit();
-              });
+              }
             });
 
             app.on('window-all-closed', function () { app.quit(); });
-            app.on('before-quit', stopServer);
-          EOF
-          cat > pack/electron/package.json <<'EOF'
+            app.on('before-quit', function () {
+              quitting = true;
+              if (serverProc) {
+                try {
+                  if (process.platform === 'win32') {
+                    spawn('taskkill', ['/pid', String(serverProc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+                  } else { serverProc.kill(); }
+                } catch (e) {}
+              }
+            });
+          EOF_MAIN
+          cat > pack/electron/package.json <<'EOF_PKG'
             {
               "name": "moontvplus-desktop",
-              "version": "1.3.0",
+              "version": "1.4.0",
               "description": "MoonTVPlus desktop shell",
               "author": "MoonTVPlus",
               "private": true,
               "main": "main.js"
             }
-          EOF
-          cat > pack/package.json <<'EOF'
+          EOF_PKG
+          cat > pack/package.json <<'EOF_ROOTPKG'
             {
               "name": "moontvplus-pack",
-              "version": "1.3.0",
+              "version": "1.4.0",
               "private": true,
               "devDependencies": {
                 "electron": "^33.0.0",
@@ -218,32 +282,69 @@ jobs:
                 "appId": "com.moontvplus.desktop",
                 "productName": "MoonTVPlus",
                 "directories": { "output": "dist", "app": "electron" },
+                "compression": "maximum",
+                "electronLanguages": ["zh-CN", "en-US"],
                 "npmRebuild": false,
                 "extraResources": [
                   { "from": "webapp", "to": "webapp" },
                   { "from": "node.exe", "to": "node.exe" }
                 ],
-                "win": { "target": ["portable", "nsis"] },
-                "portable": { "artifactName": "MoonTVPlus-Portable-${version}.exe" },
+                "win": { "target": ["nsis"] },
                 "nsis": {
-                  "artifactName": "MoonTVPlus-Setup-${version}.exe",
                   "oneClick": false,
-                  "allowToChangeInstallationDirectory": true
+                  "allowToChangeInstallationDirectory": true,
+                  "differentialPackage": false,
+                  "artifactName": "MoonTVPlus-Setup-${version}.exe"
                 }
               }
             }
-          EOF
+          EOF_ROOTPKG
 
-      - name: 打包 EXE
+      - name: 打包安装版 EXE
         shell: bash
         run: |
           cd pack
           npm install --no-audit --no-fund
-          npx electron-builder --win
+          npx electron-builder --win --publish never
 
-      - name: 上传 EXE
+      - name: 生成绿色浏览器版
+        shell: bash
+        run: |
+          mkdir -p green/MoonTVPlus
+          cp pack/node.exe green/MoonTVPlus/node.exe
+          cp -r pack/webapp green/MoonTVPlus/app
+          cat > green/MoonTVPlus/Start-MoonTV.bat <<'EOF_BAT'
+            @echo off
+            chcp 65001 >nul
+            cd /d "%~dp0app"
+            set PORT=3690
+            set HOSTNAME=127.0.0.1
+            set NODE_ENV=production
+            set PASSWORD=123456
+            echo ==================================================
+            echo   MoonTVPlus is starting, please wait 3-5 seconds
+            echo   A web page will open in your browser.
+            echo   KEEP THIS WINDOW OPEN while using the app.
+            echo ==================================================
+            start "" cmd /c "timeout /t 4 /nobreak >nul & start http://127.0.0.1:3690"
+            ..\node.exe server.js
+            echo.
+            echo Server stopped. If the page did not work, screenshot this window.
+            pause
+          EOF_BAT
+          cd green
+          powershell -Command "Compress-Archive -Path MoonTVPlus -DestinationPath MoonTVPlus-Green.zip -Force"
+
+      - name: 上传安装版
         uses: actions/upload-artifact@v4
         with:
-          name: MoonTVPlus-Windows
+          name: MoonTVPlus-Setup
           path: pack/dist/*.exe
+          if-no-files-found: error
+
+      - name: 上传绿色版
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoonTVPlus-Green
+          path: green/MoonTVPlus-Green.zip
           if-no-files-found: error
