@@ -21,8 +21,6 @@ jobs:
         shell: bash
         run: |
           npm install -g pnpm@9
-          # 修复：项目自带的 pnpm-workspace.yaml 缺少 packages 字段，pnpm 9 会报错
-          # 检测到缺少就自动补上
           if [ -f pnpm-workspace.yaml ] && ! grep -q '^packages:' pnpm-workspace.yaml; then
             printf '\npackages:\n  - .\n' >> pnpm-workspace.yaml
           fi
@@ -65,10 +63,13 @@ jobs:
           cp -r .next/standalone/. pack/app/
           if [ -d public ]; then cp -r public pack/app/public; fi
           cp -r .next/static pack/app/.next/static
+          cp "$(which node)" pack/node.exe
+          echo "内置 Node 版本: $(node --version)"
           cat > pack/main.js <<'EOF'
             const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
             const { spawn } = require('child_process');
             const path = require('path');
+            const fs = require('fs');
             const http = require('http');
 
             const HOST = '127.0.0.1';
@@ -79,14 +80,21 @@ jobs:
             function startServer() {
               const base = app.isPackaged ? process.resourcesPath : __dirname;
               const serverJs = path.join(base, 'app', 'server.js');
-              serverProc = spawn(process.execPath, [serverJs], {
-                env: Object.assign({}, process.env, {
-                  ELECTRON_RUN_AS_NODE: '1',
-                  NODE_ENV: 'production',
-                  HOSTNAME: HOST,
-                  PORT: String(PORT),
-                  PASSWORD: PASSWORD
-                }),
+              const bundledNode = path.join(base, 'node.exe');
+              const useBundledNode = fs.existsSync(bundledNode);
+
+              const env = Object.assign({}, process.env, {
+                NODE_ENV: 'production',
+                HOSTNAME: HOST,
+                PORT: String(PORT),
+                PASSWORD: PASSWORD
+              });
+
+              const cmd = useBundledNode ? bundledNode : process.execPath;
+              if (!useBundledNode) { env.ELECTRON_RUN_AS_NODE = '1'; }
+
+              serverProc = spawn(cmd, [serverJs], {
+                env: env,
                 stdio: 'ignore',
                 windowsHide: true
               });
@@ -189,7 +197,7 @@ jobs:
           cat > pack/package.json <<'EOF'
             {
               "name": "moontvplus-desktop",
-              "version": "1.1.0",
+              "version": "1.2.0",
               "private": true,
               "main": "main.js",
               "devDependencies": {
@@ -200,8 +208,12 @@ jobs:
                 "appId": "com.moontvplus.desktop",
                 "productName": "MoonTVPlus",
                 "directories": { "output": "dist" },
+                "npmRebuild": false,
                 "files": ["main.js", "package.json"],
-                "extraResources": [{ "from": "app", "to": "app" }],
+                "extraResources": [
+                  { "from": "app", "to": "app" },
+                  { "from": "node.exe", "to": "node.exe" }
+                ],
                 "win": { "target": ["portable", "nsis"] },
                 "portable": { "artifactName": "MoonTVPlus-Portable-${version}.exe" },
                 "nsis": {
