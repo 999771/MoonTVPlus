@@ -1,0 +1,172 @@
+name: 打包Windows版EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装项目依赖
+        shell: bash
+        run: |
+          npm install -g pnpm@9
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --no-frozen-lockfile
+          else
+            pnpm install
+          fi
+
+      - name: 确保开启 standalone 输出
+        shell: node {0}
+        run: |
+          const fs = require('fs');
+          const f = fs.readdirSync('.').find(n => /^next\.config\.(js|mjs|cjs|ts)$/.test(n));
+          if (!f) { console.log('no next.config, skip'); process.exit(0); }
+          let s = fs.readFileSync(f, 'utf8');
+          if (s.indexOf('standalone') !== -1) { console.log('standalone already set'); process.exit(0); }
+          s = s.replace(/(const\s+nextConfig[^{]*\{)/, '$1\n  output: "standalone",');
+          fs.writeFileSync(f, s);
+          console.log('standalone injected into ' + f);
+
+      - name: 构建 Next.js
+        shell: bash
+        run: pnpm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+
+      - name: 组装 Electron 外壳
+        shell: bash
+        run: |
+          mkdir -p pack/app/.next
+          cp -r .next/standalone/. pack/app/
+          if [ -d public ]; then cp -r public pack/app/public; fi
+          cp -r .next/static pack/app/.next/static
+          cat > pack/main.js <<'EOF'
+            const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
+            const { spawn } = require('child_process');
+            const path = require('path');
+            const http = require('http');
+
+            const HOST = '127.0.0.1';
+            const PORT = 3690;
+            let serverProc = null;
+
+            function startServer() {
+              const base = app.isPackaged ? process.resourcesPath : __dirname;
+              const serverJs = path.join(base, 'app', 'server.js');
+              serverProc = spawn(process.execPath, [serverJs], {
+                env: Object.assign({}, process.env, {
+                  ELECTRON_RUN_AS_NODE: '1',
+                  NODE_ENV: 'production',
+                  HOSTNAME: HOST,
+                  PORT: String(PORT),
+                  PASSWORD: '123456'
+                }),
+                stdio: 'ignore',
+                windowsHide: true
+              });
+            }
+
+            function stopServer() {
+              if (!serverProc) return;
+              try {
+                if (process.platform === 'win32') {
+                  spawn('taskkill', ['/pid', String(serverProc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+                } else {
+                  serverProc.kill();
+                }
+              } catch (e) {}
+            }
+
+            function waitForServer() {
+              const started = Date.now();
+              return new Promise(function (resolve, reject) {
+                (function ping() {
+                  const req = http.get('http://' + HOST + ':' + PORT, function (res) { res.resume(); resolve(); });
+                  req.on('error', function () {
+                    if (Date.now() - started > 60000) { reject(new Error('timeout')); }
+                    else { setTimeout(ping, 400); }
+                  });
+                })();
+              });
+            }
+
+            function createWindow() {
+              Menu.setApplicationMenu(null);
+              const win = new BrowserWindow({
+                width: 1360,
+                height: 850,
+                title: 'MoonTVPlus',
+                show: false,
+                webPreferences: { contextIsolation: true, nodeIntegration: false }
+              });
+              win.once('ready-to-show', function () { win.show(); });
+              win.webContents.setWindowOpenHandler(function (d) {
+                if (d.url.indexOf('http') === 0) shell.openExternal(d.url);
+                return { action: 'deny' };
+              });
+              win.loadURL('http://' + HOST + ':' + PORT);
+            }
+
+            app.whenReady().then(function () {
+              startServer();
+              waitForServer().then(createWindow).catch(function () {
+                dialog.showErrorBox('启动失败', '内置服务未能启动，请重新打开程序试试。');
+                app.quit();
+              });
+            });
+
+            app.on('window-all-closed', function () { app.quit(); });
+            app.on('before-quit', stopServer);
+          EOF
+          cat > pack/package.json <<'EOF'
+            {
+              "name": "moontvplus-desktop",
+              "version": "1.0.0",
+              "private": true,
+              "main": "main.js",
+              "devDependencies": {
+                "electron": "^33.0.0",
+                "electron-builder": "^25.1.8"
+              },
+              "build": {
+                "appId": "com.moontvplus.desktop",
+                "productName": "MoonTVPlus",
+                "directories": { "output": "dist" },
+                "files": ["main.js", "package.json"],
+                "extraResources": [{ "from": "app", "to": "app" }],
+                "win": { "target": ["portable", "nsis"] },
+                "portable": { "artifactName": "MoonTVPlus-Portable-${version}.exe" },
+                "nsis": {
+                  "artifactName": "MoonTVPlus-Setup-${version}.exe",
+                  "oneClick": false,
+                  "allowToChangeInstallationDirectory": true
+                }
+              }
+            }
+          EOF
+
+      - name: 打包 EXE
+        shell: bash
+        run: |
+          cd pack
+          npm install --no-audit --no-fund
+          npx electron-builder --win
+
+      - name: 上传 EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoonTVPlus-Windows
+          path: pack/dist/*.exe
+          if-no-files-found: error
